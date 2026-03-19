@@ -109,7 +109,7 @@ export async function loadLazyChunks() {
                     const numEntryPoint = Number(entryPoint);
                     validChunkGroups.add([chunkIds, Number.isNaN(numEntryPoint) ? entryPoint : numEntryPoint]);
                 }
-            })));
+            }));
 
             // Loads all found valid chunk groups
             await Promise.all(
