@@ -8,18 +8,11 @@ import { addContextMenuPatch, NavContextMenuPatchCallback, removeContextMenuPatc
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 import { findByProps } from "@webpack";
-import { Menu, Toasts } from "@webpack/common";
+import { Menu, React, Toasts, UserStore } from "@webpack/common";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 const settings = definePluginSettings({
-    threshold: {
-        type: OptionType.SLIDER,
-        description: "Gate threshold (dBFS) — audio below this level is suppressed",
-        markers: [-80, -60, -40, -20, 0],
-        default: -40,
-        stickToMarkers: false,
-    },
     attack: {
         type: OptionType.SLIDER,
         description: "Attack time (ms) — how fast the gate opens when someone speaks",
@@ -36,238 +29,284 @@ const settings = definePluginSettings({
     },
     hold: {
         type: OptionType.SLIDER,
-        description: "Hold time (ms) — keeps gate open briefly after signal drops (prevents word clipping)",
+        description: "Hold time (ms) — keeps gate open briefly after signal drops",
         markers: [0, 100, 200, 400, 800],
         default: 200,
         stickToMarkers: false,
     },
     reduction: {
         type: OptionType.SLIDER,
-        description: "Gain reduction when gate is closed (dBFS) — lower = more silence",
+        description: "Volume reduction when gate is closed (dBFS) — lower = more silence",
         markers: [-100, -60, -40, -20, 0],
         default: -60,
         stickToMarkers: false,
     },
+    debugPanel: {
+        type: OptionType.BOOLEAN,
+        description: "Show debug overlay with per-user gate state",
+        default: false,
+        onChange: (v: boolean) => v ? mountPanel() : unmountPanel(),
+    },
 });
 
-// ─── Suppressed users ─────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 
 const suppressed = new Set<string>();
+const originalVolumes = new Map<string, number>();
+const speakingStates = new Map<string, boolean>();
 
-// ─── AudioWorklet source (inlined as blob) ────────────────────────────────────
-
-const WORKLET_SRC = `
-class NoiseGateProcessor extends AudioWorkletProcessor {
-    static get parameterDescriptors() {
-        return [
-            { name: "threshold", defaultValue: -40, minValue: -100, maxValue: 0, automationRate: "k-rate" },
-            { name: "attack", defaultValue: 5, minValue: 0, maxValue: 500, automationRate: "k-rate" },
-            { name: "release", defaultValue: 120, minValue: 0, maxValue: 2000, automationRate: "k-rate" },
-            { name: "hold", defaultValue: 200, minValue: 0, maxValue: 2000, automationRate: "k-rate" },
-            { name: "reduction", defaultValue: -60, minValue: -100, maxValue: 0, automationRate: "k-rate" },
-        ];
-    }
-    constructor() {
-        super();
-        this._state = "closed";
-        this._gain = 0;
-        this._holdMs = 0;
-    }
-    process(inputs, outputs, parameters) {
-        const input = inputs[0];
-        const output = outputs[0];
-        if (!input || !input.length) return true;
-        const threshLin = Math.pow(10, parameters.threshold[0] / 20);
-        const redLin = Math.pow(10, parameters.reduction[0] / 20);
-        const attackMs = parameters.attack[0];
-        const releaseMs = parameters.release[0];
-        const holdMs = parameters.hold[0];
-        const blockMs = (128 / sampleRate) * 1000;
-        let sumSq = 0, n = 0;
-        for (const ch of input) for (const s of ch) { sumSq += s * s; n++; }
-        const rms = n > 0 ? Math.sqrt(sumSq / n) : 0;
-        const loud = rms > threshLin;
-        switch (this._state) {
-            case "closed":
-                if (loud) this._state = "attack";
-                break;
-            case "attack": {
-                const step = attackMs > 0 ? blockMs / attackMs : 1;
-                this._gain = Math.min(1, this._gain + step);
-                if (this._gain >= 1) { this._gain = 1; this._state = "open"; }
-                if (!loud) { this._state = "hold"; this._holdMs = holdMs; }
-                break;
-            }
-            case "open":
-                if (!loud) { this._state = "hold"; this._holdMs = holdMs; }
-                break;
-            case "hold":
-                if (loud) { this._state = "open"; }
-                else if ((this._holdMs -= blockMs) <= 0) this._state = "release";
-                break;
-            case "release": {
-                const step = releaseMs > 0 ? blockMs / releaseMs : 1;
-                this._gain = Math.max(redLin, this._gain - step);
-                if (this._gain <= redLin) { this._gain = redLin; this._state = "closed"; }
-                if (loud) this._state = "attack";
-                break;
-            }
-        }
-        for (let c = 0; c < output.length; c++) {
-            const inCh = input[c] || new Float32Array(128);
-            const outCh = output[c];
-            for (let i = 0; i < outCh.length; i++) outCh[i] = inCh[i] * this._gain;
-        }
-        return true;
-    }
+interface GateState {
+    state: "closed" | "attack" | "open" | "hold" | "release";
+    gain: number;
+    holdMs: number;
 }
-registerProcessor("noise-gate-processor", NoiseGateProcessor);
-`;
+const gateStates = new Map<string, GateState>();
 
-// ─── Audio graph ──────────────────────────────────────────────────────────────
-
-interface UserGraph {
-    source: MediaStreamAudioSourceNode;
-    gate: AudioWorkletNode | null;
-    gain: GainNode;
-    ctx: AudioContext;
-    element: HTMLAudioElement;
-}
-
-const graphs = new Map<string, UserGraph>();
-let audioCtx: AudioContext | null = null;
-let workletReady = false;
-
-async function getCtx(): Promise<AudioContext> {
-    if (!audioCtx || audioCtx.state === "closed") {
-        audioCtx = new AudioContext();
-        workletReady = false;
-    }
-    if (audioCtx.state === "suspended") await audioCtx.resume();
-    return audioCtx;
-}
-
-async function loadWorklet(ctx: AudioContext): Promise<boolean> {
-    if (workletReady) return true;
-    try {
-        const blob = new Blob([WORKLET_SRC], { type: "application/javascript" });
-        const url = URL.createObjectURL(blob);
-        await ctx.audioWorklet.addModule(url);
-        URL.revokeObjectURL(url);
-        workletReady = true;
-        return true;
-    } catch (e) {
-        console.error("[SelectiveNR] Worklet load failed:", e);
-        return false;
-    }
-}
-
-function makeGateNode(ctx: AudioContext): AudioWorkletNode {
-    const node = new AudioWorkletNode(ctx, "noise-gate-processor", {
-        numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
-    });
-    const s = settings.store;
-    node.parameters.get("threshold")!.value = s.threshold;
-    node.parameters.get("attack")!.value = s.attack;
-    node.parameters.get("release")!.value = s.release;
-    node.parameters.get("hold")!.value = s.hold;
-    node.parameters.get("reduction")!.value = s.reduction;
-    return node;
-}
-
-async function hookUser(userId: string, stream: MediaStream, el: HTMLAudioElement) {
-    unhookUser(userId);
-    const ctx = await getCtx();
-    const ok = await loadWorklet(ctx);
-    const source = ctx.createMediaStreamSource(stream);
-    const gain = ctx.createGain();
-    gain.gain.value = 1;
-    let gate: AudioWorkletNode | null = null;
-    if (suppressed.has(userId) && ok) {
-        gate = makeGateNode(ctx);
-        source.connect(gate);
-        gate.connect(gain);
-    } else {
-        source.connect(gain);
-    }
-    gain.connect(ctx.destination);
-    el.volume = 0;
-    graphs.set(userId, { source, gate, gain, ctx, element: el });
-}
-
-function unhookUser(userId: string) {
-    const g = graphs.get(userId);
-    if (!g) return;
-    try { g.source.disconnect(); } catch { }
-    try { g.gate?.disconnect(); } catch { }
-    try { g.gain.disconnect(); } catch { }
-    g.element.volume = 1;
-    graphs.delete(userId);
-}
-
-async function applyGate(userId: string) {
-    const g = graphs.get(userId);
-    if (!g || g.gate) return;
-    const ok = await loadWorklet(g.ctx);
-    if (!ok) return;
-    try {
-        g.source.disconnect();
-        g.gate = makeGateNode(g.ctx);
-        g.source.connect(g.gate);
-        g.gate.connect(g.gain);
-    } catch (e) {
-        console.error("[SelectiveNR] applyGate:", e);
-    }
-}
-
-function removeGate(userId: string) {
-    const g = graphs.get(userId);
-    if (!g || !g.gate) return;
-    try {
-        g.source.disconnect();
-        g.gate.disconnect();
-        g.source.connect(g.gain);
-        g.gate = null;
-    } catch (e) {
-        console.error("[SelectiveNR] removeGate:", e);
-    }
-}
-
-// ─── DOM observer ─────────────────────────────────────────────────────────────
-
-let observer: MutationObserver | null = null;
 let MediaEngineStore: any = null;
+let MediaEngineActions: any = null;
+let gateInterval: ReturnType<typeof setInterval> | null = null;
+let currentConn: any = null;
+const origHandlers = new WeakMap<object, Function | null>();
 
-function userIdForStream(stream: MediaStream): string | null {
-    try {
-        const conns = MediaEngineStore?.getMediaEngine?.()?.connections ?? {};
-        for (const conn of Object.values(conns) as any[]) {
-            if (conn?.stream === stream || conn?.remoteStream === stream)
-                return conn.userId ?? null;
-        }
-    } catch { }
+const TICK_MS = 50;
+
+// ─── MediaEngine helpers ──────────────────────────────────────────────────────
+
+function getConn(): any | null {
+    const me = MediaEngineStore?.getMediaEngine?.();
+    if (!me?.connections) return null;
+    for (const conn of me.connections)
+        if (conn.context === "default") return conn;
     return null;
 }
 
-function watchElement(el: HTMLAudioElement) {
-    if (!(el.srcObject instanceof MediaStream)) return;
-    const stream = el.srcObject;
-    let tries = 0;
-    const poll = setInterval(() => {
-        const userId = userIdForStream(stream);
-        if (userId) { clearInterval(poll); hookUser(userId, stream, el); }
-        else if (++tries > 20) clearInterval(poll);
-    }, 100);
+function getRemoteUserIds(): string[] {
+    const conn = getConn();
+    return conn ? Object.keys(conn.remoteAudioSSRCs ?? {}) : [];
 }
 
-function startObserver() {
-    observer = new MutationObserver(muts => {
-        for (const m of muts)
-            for (const node of m.addedNodes)
-                if (node instanceof HTMLAudioElement) watchElement(node);
+function isSpeaking(userId: string): boolean {
+    return speakingStates.get(userId) ?? false;
+}
+
+// ─── Speaking callback ────────────────────────────────────────────────────────
+
+function setupSpeakingCallback(conn: any) {
+    if (!conn?.conn?.setOnSpeakingCallback || origHandlers.has(conn)) return;
+    const orig = conn.handleSpeakingNative?.bind(conn) ?? null;
+    origHandlers.set(conn, orig);
+    conn.conn.setOnSpeakingCallback((userId: string, speaking: number, level: number) => {
+        speakingStates.set(String(userId), speaking !== 0);
     });
-    observer.observe(document.body, { childList: true, subtree: true });
-    document.querySelectorAll("audio").forEach(el => watchElement(el as HTMLAudioElement));
+}
+
+function teardownSpeakingCallback(conn: any) {
+    if (!origHandlers.has(conn)) return;
+    const orig = origHandlers.get(conn);
+    conn.conn?.setOnSpeakingCallback?.(orig ?? null);
+    origHandlers.delete(conn);
+}
+
+function setVol(userId: string, vol: number) {
+    MediaEngineActions?.setLocalVolume?.(userId, Math.max(0, Math.min(200, vol)));
+}
+
+function getSavedVol(userId: string): number {
+    return originalVolumes.get(userId) ?? 100;
+}
+
+// ─── Gate ────────────────────────────────────────────────────────────────────
+
+function startSuppressing(userId: string) {
+    if (gateStates.has(userId)) return;
+    const conn = getConn();
+    const vol = conn?.localVolumes?.[userId] ?? 100;
+    originalVolumes.set(userId, vol);
+    const redLin = Math.pow(10, settings.store.reduction / 20);
+    gateStates.set(userId, { state: "closed", gain: redLin, holdMs: 0 });
+    setVol(userId, vol * redLin);
+}
+
+function stopSuppressing(userId: string) {
+    setVol(userId, getSavedVol(userId));
+    originalVolumes.delete(userId);
+    gateStates.delete(userId);
+}
+
+function tickGates() {
+    const conn = getConn();
+    if (conn !== currentConn) {
+        if (currentConn) teardownSpeakingCallback(currentConn);
+        currentConn = conn;
+        if (conn) setupSpeakingCallback(conn);
+    }
+
+    const blockMs = TICK_MS;
+    const s = settings.store;
+    const redLin = Math.pow(10, s.reduction / 20);
+
+    for (const [userId, gate] of gateStates) {
+        const loud = isSpeaking(userId);
+        const prevGain = gate.gain;
+
+        switch (gate.state) {
+            case "closed":
+                if (loud) gate.state = "attack";
+                break;
+            case "attack": {
+                const step = s.attack > 0 ? blockMs / s.attack : 1;
+                gate.gain = Math.min(1, gate.gain + step);
+                if (gate.gain >= 1) { gate.gain = 1; gate.state = "open"; }
+                if (!loud) { gate.state = "hold"; gate.holdMs = s.hold; }
+                break;
+            }
+            case "open":
+                if (!loud) { gate.state = "hold"; gate.holdMs = s.hold; }
+                break;
+            case "hold":
+                if (loud) gate.state = "open";
+                else if ((gate.holdMs -= blockMs) <= 0) gate.state = "release";
+                break;
+            case "release": {
+                const step = s.release > 0 ? blockMs / s.release : 1;
+                gate.gain = Math.max(redLin, gate.gain - step);
+                if (gate.gain <= redLin) { gate.gain = redLin; gate.state = "closed"; }
+                if (loud) gate.state = "attack";
+                break;
+            }
+        }
+
+        if (gate.gain !== prevGain)
+            setVol(userId, getSavedVol(userId) * gate.gain);
+    }
+}
+
+// ─── Debug panel ──────────────────────────────────────────────────────────────
+
+const GATE_COLORS: Record<string, string> = {
+    open:        "#23a55a",
+    attack:      "#f0b132",
+    hold:        "#f0b132",
+    release:     "#e8702a",
+    closed:      "#80848e",
+    passthrough: "#5865f2",
+};
+
+function DebugPanel() {
+    interface Row {
+        userId: string;
+        username: string;
+        suppressed: boolean;
+        speaking: boolean;
+        gateState: string;
+        gateGain: number;
+    }
+
+    const [rows, setRows] = React.useState<Row[]>([]);
+
+    React.useEffect(() => {
+        const timer = setInterval(() => {
+            const userIds = getRemoteUserIds();
+            setRows(userIds.map(userId => {
+                const user = (UserStore as any).getUser(userId);
+                const gate = gateStates.get(userId);
+                return {
+                    userId,
+                    username:   user?.globalName || user?.username || userId,
+                    suppressed: suppressed.has(userId),
+                    speaking:   isSpeaking(userId),
+                    gateState:  gate?.state ?? "passthrough",
+                    gateGain:   gate?.gain ?? 1,
+                };
+            }));
+        }, 100);
+        return () => clearInterval(timer);
+    }, []);
+
+    return (
+        <div style={{
+            position: "fixed", bottom: "72px", right: "8px", width: "260px",
+            background: "rgba(30,31,34,0.96)",
+            border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: "8px", padding: "10px 12px",
+            fontFamily: "var(--font-code)", fontSize: "11px", color: "#b5bac1",
+            zIndex: 9999, pointerEvents: "none",
+            backdropFilter: "blur(10px)",
+            boxShadow: "0 4px 24px rgba(0,0,0,0.6)",
+        }}>
+            <div style={{ color: "#e0e1e5", fontWeight: 700, fontSize: "11px", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: "8px" }}>
+                SelectiveNR Debug
+            </div>
+            {rows.length === 0
+                ? <div style={{ color: "#80848e", fontStyle: "italic" }}>No VC users tracked</div>
+                : rows.map(r => {
+                    const stCol   = GATE_COLORS[r.gateState] ?? "#80848e";
+                    const gainDb  = 20 * Math.log10(Math.max(r.gateGain, 1e-6));
+                    const gainPct = r.gateGain * 100;
+                    return (
+                        <div key={r.userId} style={{ marginBottom: "8px", paddingBottom: "8px", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "5px" }}>
+                                <div style={{
+                                    width: "7px", height: "7px", borderRadius: "50%", flexShrink: 0,
+                                    background: r.speaking ? "#23a55a" : "#4e5058",
+                                    boxShadow: r.speaking ? "0 0 5px #23a55a" : "none",
+                                    transition: "background 0.1s, box-shadow 0.1s",
+                                }} />
+                                <span style={{ flex: 1, fontWeight: 600, color: "#e0e1e5", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                    {r.username}
+                                </span>
+                                <span style={{
+                                    fontSize: "9px", fontWeight: 700, letterSpacing: "0.07em",
+                                    padding: "1px 5px", borderRadius: "3px",
+                                    color:      r.suppressed ? "#f0b132" : "#23a55a",
+                                    background: r.suppressed ? "#f0b13220" : "#23a55a20",
+                                    border:     `1px solid ${r.suppressed ? "#f0b13250" : "#23a55a50"}`,
+                                }}>
+                                    {r.suppressed ? "GATED" : "ACTIVE"}
+                                </span>
+                            </div>
+                            {r.suppressed && (<>
+                                <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "4px" }}>
+                                    <span style={{ width: "34px", color: "#80848e", fontSize: "10px" }}>gain</span>
+                                    <div style={{ flex: 1, height: "5px", background: "#111214", borderRadius: "3px", overflow: "hidden" }}>
+                                        <div style={{ width: `${gainPct}%`, height: "100%", background: stCol, borderRadius: "3px", transition: "width 0.08s ease, background 0.12s" }} />
+                                    </div>
+                                    <span style={{ width: "46px", textAlign: "right", color: stCol }}>{gainDb.toFixed(1)} dB</span>
+                                </div>
+                                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <span style={{ width: "34px", color: "#80848e", fontSize: "10px" }}>gate</span>
+                                    <span style={{ color: stCol, fontWeight: 700, letterSpacing: "0.06em" }}>
+                                        {r.gateState.toUpperCase()}
+                                    </span>
+                                </div>
+                            </>)}
+                        </div>
+                    );
+                })
+            }
+        </div>
+    );
+}
+
+let panelContainer: HTMLDivElement | null = null;
+let panelRoot: any = null;
+
+function mountPanel() {
+    if (panelContainer) return;
+    const ReactDOM = findByProps("createRoot");
+    if (!ReactDOM?.createRoot) { console.error("[SelectiveNR] ReactDOM.createRoot not found"); return; }
+    panelContainer = document.createElement("div");
+    panelContainer.id = "snr-debug-root";
+    document.body.appendChild(panelContainer);
+    panelRoot = ReactDOM.createRoot(panelContainer);
+    panelRoot.render(<DebugPanel />);
+}
+
+function unmountPanel() {
+    panelRoot?.unmount();
+    panelContainer?.remove();
+    panelContainer = null;
+    panelRoot = null;
 }
 
 // ─── Context menu ─────────────────────────────────────────────────────────────
@@ -284,20 +323,12 @@ const ctxMenuPatch: NavContextMenuPatchCallback = (children, { user }) => {
             action={() => {
                 if (isSuppressed) {
                     suppressed.delete(user.id);
-                    removeGate(user.id);
-                    Toasts.show({
-                        message: `${user.username} — noise gate removed`,
-                        type: Toasts.Type.SUCCESS,
-                        id: Toasts.genId(),
-                    });
+                    stopSuppressing(user.id);
+                    Toasts.show({ message: `${user.username} — noise gate removed`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
                 } else {
                     suppressed.add(user.id);
-                    applyGate(user.id);
-                    Toasts.show({
-                        message: `${user.username} — noise gate applied`,
-                        type: Toasts.Type.SUCCESS,
-                        id: Toasts.genId(),
-                    });
+                    startSuppressing(user.id);
+                    Toasts.show({ message: `${user.username} — noise gate applied`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
                 }
             }}
         />
@@ -313,23 +344,22 @@ export default definePlugin({
     settings,
 
     start() {
-        try {
-            MediaEngineStore = findByProps("getMediaEngine", "getVideoStream");
-        } catch {
-            console.warn("[SelectiveNR] MediaEngineStore not found — gate may not apply until next audio event");
-        }
-        startObserver();
+        MediaEngineStore   = findByProps("getMediaEngine");
+        MediaEngineActions = findByProps("setLocalVolume");
+        gateInterval = setInterval(tickGates, TICK_MS);
         addContextMenuPatch("user-context", ctxMenuPatch);
+        if (settings.store.debugPanel) mountPanel();
     },
 
     stop() {
-        observer?.disconnect();
-        observer = null;
+        unmountPanel();
+        if (gateInterval) { clearInterval(gateInterval); gateInterval = null; }
+        if (currentConn) { teardownSpeakingCallback(currentConn); currentConn = null; }
+        speakingStates.clear();
         removeContextMenuPatch("user-context", ctxMenuPatch);
-        for (const id of [...graphs.keys()]) unhookUser(id);
-        audioCtx?.close();
-        audioCtx = null;
-        workletReady = false;
+        for (const userId of suppressed) stopSuppressing(userId);
         suppressed.clear();
+        MediaEngineStore   = null;
+        MediaEngineActions = null;
     },
 });
