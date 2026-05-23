@@ -151,6 +151,7 @@ function tickGates() {
 
         switch (gate.state) {
             case "closed":
+                if (gate.gain !== redLin) gate.gain = redLin;
                 if (loud) gate.state = "attack";
                 break;
             case "attack": {
