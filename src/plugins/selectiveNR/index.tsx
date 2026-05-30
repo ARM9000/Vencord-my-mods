@@ -36,9 +36,9 @@ const settings = definePluginSettings({
     },
     reduction: {
         type: OptionType.SLIDER,
-        description: "Volume reduction when gate is closed (dBFS) — lower = more silence",
+        description: "Volume reduction when gate is closed (dBFS) — lower = more silence. Default -100 = full silence.",
         markers: [-100, -60, -40, -20, 0],
-        default: -60,
+        default: -100,
         stickToMarkers: false,
     },
     debugPanel: {
@@ -120,7 +120,8 @@ function getSavedVol(userId: string): number {
 function startSuppressing(userId: string) {
     if (gateStates.has(userId)) return;
     const conn = getConn();
-    const vol = conn?.localVolumes?.[userId] ?? 100;
+    if (!conn) return;
+    const vol = conn.localVolumes?.[userId] ?? 100;
     originalVolumes.set(userId, vol);
     const redLin = Math.pow(10, settings.store.reduction / 20);
     gateStates.set(userId, { state: "closed", gain: redLin, holdMs: 0 });
@@ -241,8 +242,8 @@ function DebugPanel() {
             {rows.length === 0
                 ? <div style={{ color: "#80848e", fontStyle: "italic" }}>No VC users tracked</div>
                 : rows.map(r => {
-                    const stCol   = GATE_COLORS[r.gateState] ?? "#80848e";
-                    const gainDb  = 20 * Math.log10(Math.max(r.gateGain, 1e-6));
+                    const stCol = GATE_COLORS[r.gateState] ?? "#80848e";
+                    const gainDb = 20 * Math.log10(Math.max(r.gateGain, 1e-6));
                     const gainPct = r.gateGain * 100;
                     return (
                         <div key={r.userId} style={{ marginBottom: "8px", paddingBottom: "8px", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
@@ -345,7 +346,7 @@ export default definePlugin({
     settings,
 
     start() {
-        MediaEngineStore   = findByProps("getMediaEngine");
+        MediaEngineStore = findByProps("getMediaEngine");
         MediaEngineActions = findByProps("setLocalVolume");
         gateInterval = setInterval(tickGates, TICK_MS);
         addContextMenuPatch("user-context", ctxMenuPatch);
@@ -360,7 +361,7 @@ export default definePlugin({
         removeContextMenuPatch("user-context", ctxMenuPatch);
         for (const userId of suppressed) stopSuppressing(userId);
         suppressed.clear();
-        MediaEngineStore   = null;
+        MediaEngineStore = null;
         MediaEngineActions = null;
     },
 });
