@@ -4,13 +4,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { addContextMenuPatch, NavContextMenuPatchCallback, removeContextMenuPatch } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { findByProps } from "@webpack";
+import { findByPropsLazy } from "@webpack";
 import { Menu, React, Toasts, UserStore } from "@webpack/common";
-
-// ─── Settings ────────────────────────────────────────────────────────────────
 
 const settings = definePluginSettings({
     attack: {
@@ -49,7 +46,9 @@ const settings = definePluginSettings({
     },
 });
 
-// ─── State ────────────────────────────────────────────────────────────────────
+const MediaEngineStore = findByPropsLazy("getMediaEngine");
+const MediaEngineActions = findByPropsLazy("setLocalVolume");
+const ReactDOM = findByPropsLazy("createRoot");
 
 const suppressed = new Set<string>();
 const originalVolumes = new Map<string, number>();
@@ -62,15 +61,11 @@ interface GateState {
 }
 const gateStates = new Map<string, GateState>();
 
-let MediaEngineStore: any = null;
-let MediaEngineActions: any = null;
 let gateInterval: ReturnType<typeof setInterval> | null = null;
 let currentConn: any = null;
 const origHandlers = new WeakMap<object, Function | null>();
 
 const TICK_MS = 50;
-
-// ─── MediaEngine helpers ──────────────────────────────────────────────────────
 
 function getConn(): any | null {
     const me = MediaEngineStore?.getMediaEngine?.();
@@ -89,13 +84,11 @@ function isSpeaking(userId: string): boolean {
     return speakingStates.get(userId) ?? false;
 }
 
-// ─── Speaking callback ────────────────────────────────────────────────────────
-
 function setupSpeakingCallback(conn: any) {
     if (!conn?.conn?.setOnSpeakingCallback || origHandlers.has(conn)) return;
     const orig = conn.handleSpeakingNative?.bind(conn) ?? null;
     origHandlers.set(conn, orig);
-    conn.conn.setOnSpeakingCallback((userId: string, speaking: number, level: number) => {
+    conn.conn.setOnSpeakingCallback((userId: string, speaking: number) => {
         speakingStates.set(String(userId), speaking !== 0);
     });
 }
@@ -114,8 +107,6 @@ function setVol(userId: string, vol: number) {
 function getSavedVol(userId: string): number {
     return originalVolumes.get(userId) ?? 100;
 }
-
-// ─── Gate ────────────────────────────────────────────────────────────────────
 
 function startSuppressing(userId: string) {
     if (gateStates.has(userId)) return;
@@ -142,7 +133,6 @@ function tickGates() {
         if (conn) setupSpeakingCallback(conn);
     }
 
-    const blockMs = TICK_MS;
     const s = settings.store;
     const redLin = Math.pow(10, s.reduction / 20);
 
@@ -156,7 +146,7 @@ function tickGates() {
                 if (loud) gate.state = "attack";
                 break;
             case "attack": {
-                const step = s.attack > 0 ? blockMs / s.attack : 1;
+                const step = s.attack > 0 ? TICK_MS / s.attack : 1;
                 gate.gain = Math.min(1, gate.gain + step);
                 if (gate.gain >= 1) { gate.gain = 1; gate.state = "open"; }
                 if (!loud) { gate.state = "hold"; gate.holdMs = s.hold; }
@@ -167,10 +157,10 @@ function tickGates() {
                 break;
             case "hold":
                 if (loud) gate.state = "open";
-                else if ((gate.holdMs -= blockMs) <= 0) gate.state = "release";
+                else if ((gate.holdMs -= TICK_MS) <= 0) gate.state = "release";
                 break;
             case "release": {
-                const step = s.release > 0 ? blockMs / s.release : 1;
+                const step = s.release > 0 ? TICK_MS / s.release : 1;
                 gate.gain = Math.max(redLin, gate.gain - step);
                 if (gate.gain <= redLin) { gate.gain = redLin; gate.state = "closed"; }
                 if (loud) gate.state = "attack";
@@ -183,14 +173,12 @@ function tickGates() {
     }
 }
 
-// ─── Debug panel ──────────────────────────────────────────────────────────────
-
 const GATE_COLORS: Record<string, string> = {
-    open:        "#23a55a",
-    attack:      "#f0b132",
-    hold:        "#f0b132",
-    release:     "#e8702a",
-    closed:      "#80848e",
+    open: "#23a55a",
+    attack: "#f0b132",
+    hold: "#f0b132",
+    release: "#e8702a",
+    closed: "#80848e",
     passthrough: "#5865f2",
 };
 
@@ -210,15 +198,15 @@ function DebugPanel() {
         const timer = setInterval(() => {
             const userIds = getRemoteUserIds();
             setRows(userIds.map(userId => {
-                const user = (UserStore as any).getUser(userId);
+                const user = UserStore.getUser(userId);
                 const gate = gateStates.get(userId);
                 return {
                     userId,
-                    username:   user?.globalName || user?.username || userId,
+                    username: user?.globalName ?? user?.username ?? userId,
                     suppressed: suppressed.has(userId),
-                    speaking:   isSpeaking(userId),
-                    gateState:  gate?.state ?? "passthrough",
-                    gateGain:   gate?.gain ?? 1,
+                    speaking: isSpeaking(userId),
+                    gateState: gate?.state ?? "passthrough",
+                    gateGain: gate?.gain ?? 1,
                 };
             }));
         }, 100);
@@ -260,9 +248,9 @@ function DebugPanel() {
                                 <span style={{
                                     fontSize: "9px", fontWeight: 700, letterSpacing: "0.07em",
                                     padding: "1px 5px", borderRadius: "3px",
-                                    color:      r.suppressed ? "#f0b132" : "#23a55a",
+                                    color: r.suppressed ? "#f0b132" : "#23a55a",
                                     background: r.suppressed ? "#f0b13220" : "#23a55a20",
-                                    border:     `1px solid ${r.suppressed ? "#f0b13250" : "#23a55a50"}`,
+                                    border: `1px solid ${r.suppressed ? "#f0b13250" : "#23a55a50"}`,
                                 }}>
                                     {r.suppressed ? "GATED" : "ACTIVE"}
                                 </span>
@@ -295,7 +283,6 @@ let panelRoot: any = null;
 
 function mountPanel() {
     if (panelContainer) return;
-    const ReactDOM = findByProps("createRoot");
     if (!ReactDOM?.createRoot) { console.error("[SelectiveNR] ReactDOM.createRoot not found"); return; }
     panelContainer = document.createElement("div");
     panelContainer.id = "snr-debug-root";
@@ -311,45 +298,40 @@ function unmountPanel() {
     panelRoot = null;
 }
 
-// ─── Context menu ─────────────────────────────────────────────────────────────
-
-const ctxMenuPatch: NavContextMenuPatchCallback = (children, { user }) => {
-    if (!user?.id) return;
-    const isSuppressed = suppressed.has(user.id);
-    children.push(
-        <Menu.MenuSeparator key="snr-sep" />,
-        <Menu.MenuItem
-            key="snr-toggle"
-            id="snr-toggle"
-            label={isSuppressed ? "Unsuppress" : "Suppress"}
-            action={() => {
-                if (isSuppressed) {
-                    suppressed.delete(user.id);
-                    stopSuppressing(user.id);
-                    Toasts.show({ message: `${user.username} — noise gate removed`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
-                } else {
-                    suppressed.add(user.id);
-                    startSuppressing(user.id);
-                    Toasts.show({ message: `${user.username} — noise gate applied`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
-                }
-            }}
-        />
-    );
-};
-
-// ─── Plugin ───────────────────────────────────────────────────────────────────
-
 export default definePlugin({
     name: "SelectiveNR",
     description: "Right-click any VC user to suppress or unsuppress their audio with a per-user noise gate.",
     authors: [{ name: "ARM9000", id: 540642909930782738n }],
     settings,
 
+    contextMenus: {
+        "user-context": (children, { user }) => {
+            if (!user?.id) return;
+            const isSuppressed = suppressed.has(user.id);
+            children.push(
+                <Menu.MenuSeparator key="snr-sep" />,
+                <Menu.MenuItem
+                    key="snr-toggle"
+                    id="snr-toggle"
+                    label={isSuppressed ? "Unsuppress" : "Suppress"}
+                    action={() => {
+                        if (isSuppressed) {
+                            suppressed.delete(user.id);
+                            stopSuppressing(user.id);
+                            Toasts.show({ message: `Noise gate removed for ${user.username}`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
+                        } else {
+                            suppressed.add(user.id);
+                            startSuppressing(user.id);
+                            Toasts.show({ message: `Noise gate applied to ${user.username}`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
+                        }
+                    }}
+                />
+            );
+        },
+    },
+
     start() {
-        MediaEngineStore = findByProps("getMediaEngine");
-        MediaEngineActions = findByProps("setLocalVolume");
         gateInterval = setInterval(tickGates, TICK_MS);
-        addContextMenuPatch("user-context", ctxMenuPatch);
         if (settings.store.debugPanel) mountPanel();
     },
 
@@ -358,10 +340,7 @@ export default definePlugin({
         if (gateInterval) { clearInterval(gateInterval); gateInterval = null; }
         if (currentConn) { teardownSpeakingCallback(currentConn); currentConn = null; }
         speakingStates.clear();
-        removeContextMenuPatch("user-context", ctxMenuPatch);
         for (const userId of suppressed) stopSuppressing(userId);
         suppressed.clear();
-        MediaEngineStore = null;
-        MediaEngineActions = null;
     },
 });
