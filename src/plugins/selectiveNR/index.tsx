@@ -7,7 +7,7 @@
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { Menu, React, Toasts, UserStore } from "@webpack/common";
+import { Menu, React, SelectedChannelStore, Toasts, UserStore, VoiceStateStore } from "@webpack/common";
 
 const settings = definePluginSettings({
     attack: {
@@ -306,7 +306,11 @@ export default definePlugin({
 
     contextMenus: {
         "user-context": (children, { user }) => {
-            if (!user?.id) return;
+            if (!user?.id || user.id === UserStore.getCurrentUser()?.id) return;
+
+            const myVoiceChannelId = SelectedChannelStore.getVoiceChannelId();
+            if (!myVoiceChannelId || VoiceStateStore.getVoiceStateForUser(user.id)?.channelId !== myVoiceChannelId) return;
+
             const isSuppressed = suppressed.has(user.id);
             children.push(
                 <Menu.MenuSeparator key="snr-sep" />,
