@@ -6,7 +6,7 @@ Right-click any user in a VC → **Suppress** to apply a noise gate to their aud
 
 ## How it works
 
-Each Discord user's audio is a separate `MediaStream`. This plugin intercepts the streams and routes them through a custom (noise gate) running on the audio thread. Whitelisted users get a clean passthrough; suppressed users get their audio gated.
+A noise gate state machine runs on a 50 ms tick. Speaking state comes from Discord's `SpeakingStore`; when a suppressed user starts talking the gate opens (attack), holds, then closes again (release) once they stop. The gain is applied by driving that user's local volume, with their pre-suppression volume saved so it can be restored. Unsuppressed users are never touched.
 
 ## Settings
 
@@ -15,7 +15,7 @@ Each Discord user's audio is a separate `MediaStream`. This plugin intercepts th
 | Attack | How fast the gate opens when someone speaks (ms) | 5 ms |
 | Release | How fast the gate closes after they stop (ms) | 120 ms |
 | Hold | Extra time to keep gate open after signal drops — prevents word clipping (ms) | 200 ms |
-| Reduction | Gain applied when gate is closed (dBFS) | -60 dB |
+| Reduction | Gain applied when gate is closed (dBFS) | -100 dB |
 
 ## Usage
 

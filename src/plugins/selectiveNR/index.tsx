@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { findByPropsLazy } from "@webpack";
+import { findByPropsLazy, findStoreLazy } from "@webpack";
 import { Menu, React, SelectedChannelStore, Toasts, UserStore, VoiceStateStore } from "@webpack/common";
 
 const settings = definePluginSettings({
@@ -48,11 +49,18 @@ const settings = definePluginSettings({
 
 const MediaEngineStore = findByPropsLazy("getMediaEngine");
 const MediaEngineActions = findByPropsLazy("setLocalVolume");
+const SpeakingStore = findStoreLazy("SpeakingStore");
 const ReactDOM = findByPropsLazy("createRoot");
+
+/**
+ * Gated volumes are written through setLocalVolume, which Discord persists and syncs.
+ * If the client reloads while a gate is closed, the user is stranded at the reduced
+ * volume with no in-memory record of what it used to be, so mirror the map to disk.
+ */
+const VOLUMES_KEY = "SelectiveNR_originalVolumes";
 
 const suppressed = new Set<string>();
 const originalVolumes = new Map<string, number>();
-const speakingStates = new Map<string, boolean>();
 
 interface GateState {
     state: "closed" | "attack" | "open" | "hold" | "release";
@@ -62,8 +70,6 @@ interface GateState {
 const gateStates = new Map<string, GateState>();
 
 let gateInterval: ReturnType<typeof setInterval> | null = null;
-let currentConn: any = null;
-const origHandlers = new WeakMap<object, Function | null>();
 
 const TICK_MS = 50;
 
@@ -81,58 +87,59 @@ function getRemoteUserIds(): string[] {
 }
 
 function isSpeaking(userId: string): boolean {
-    return speakingStates.get(userId) ?? false;
-}
-
-function setupSpeakingCallback(conn: any) {
-    if (!conn?.conn?.setOnSpeakingCallback || origHandlers.has(conn)) return;
-    const orig = conn.handleSpeakingNative?.bind(conn) ?? null;
-    origHandlers.set(conn, orig);
-    conn.conn.setOnSpeakingCallback((userId: string, speaking: number) => {
-        speakingStates.set(String(userId), speaking !== 0);
-    });
-}
-
-function teardownSpeakingCallback(conn: any) {
-    if (!origHandlers.has(conn)) return;
-    const orig = origHandlers.get(conn);
-    conn.conn?.setOnSpeakingCallback?.(orig ?? null);
-    origHandlers.delete(conn);
+    // Read Discord's own Flux store rather than hijacking the native voice
+    // connection's speaking callback, which is keyed by SSRC and clobbers
+    // Discord's speaking indicators.
+    if (SpeakingStore?.getSpeakingFlags) return SpeakingStore.getSpeakingFlags(userId) !== 0;
+    return SpeakingStore?.isSpeaking?.(userId) ?? false;
 }
 
 function setVol(userId: string, vol: number) {
-    MediaEngineActions?.setLocalVolume?.(userId, Math.max(0, Math.min(200, vol)));
+    // No upper clamp: VolumeBooster users legitimately sit above 200.
+    MediaEngineActions?.setLocalVolume?.(userId, Math.max(0, vol));
 }
 
-function getSavedVol(userId: string): number {
-    return originalVolumes.get(userId) ?? 100;
+function persistVolumes() {
+    DataStore.set(VOLUMES_KEY, Object.fromEntries(originalVolumes))
+        .catch(e => console.error("[SelectiveNR] failed to persist volumes", e));
 }
 
-function startSuppressing(userId: string) {
-    if (gateStates.has(userId)) return;
+function getSavedVol(userId: string): number | undefined {
+    return originalVolumes.get(userId);
+}
+
+function startSuppressing(userId: string): boolean {
+    if (gateStates.has(userId)) return true;
     const conn = getConn();
-    if (!conn) return;
+    if (!conn) return false;
     const vol = conn.localVolumes?.[userId] ?? 100;
     originalVolumes.set(userId, vol);
+    persistVolumes();
     const redLin = Math.pow(10, settings.store.reduction / 20);
     gateStates.set(userId, { state: "closed", gain: redLin, holdMs: 0 });
     setVol(userId, vol * redLin);
+    return true;
 }
 
 function stopSuppressing(userId: string) {
-    setVol(userId, getSavedVol(userId));
+    // Only restore if we actually recorded a volume — otherwise we would be
+    // inventing a value for someone we never touched.
+    const saved = getSavedVol(userId);
+    if (saved !== undefined) setVol(userId, saved);
     originalVolumes.delete(userId);
+    persistVolumes();
     gateStates.delete(userId);
 }
 
-function tickGates() {
-    const conn = getConn();
-    if (conn !== currentConn) {
-        if (currentConn) teardownSpeakingCallback(currentConn);
-        currentConn = conn;
-        if (conn) setupSpeakingCallback(conn);
-    }
+/** Restore anyone left gated by a reload/crash while their gate was closed. */
+async function restoreStaleVolumes() {
+    const stale = await DataStore.get<Record<string, number>>(VOLUMES_KEY);
+    if (!stale) return;
+    for (const [userId, vol] of Object.entries(stale)) setVol(userId, vol);
+    await DataStore.del(VOLUMES_KEY);
+}
 
+function tickGates() {
     const s = settings.store;
     const redLin = Math.pow(10, s.reduction / 20);
 
@@ -169,7 +176,7 @@ function tickGates() {
         }
 
         if (gate.gain !== prevGain)
-            setVol(userId, getSavedVol(userId) * gate.gain);
+            setVol(userId, (getSavedVol(userId) ?? 100) * gate.gain);
     }
 }
 
@@ -323,10 +330,11 @@ export default definePlugin({
                             suppressed.delete(user.id);
                             stopSuppressing(user.id);
                             Toasts.show({ message: `Noise gate removed for ${user.username}`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
-                        } else {
+                        } else if (startSuppressing(user.id)) {
                             suppressed.add(user.id);
-                            startSuppressing(user.id);
                             Toasts.show({ message: `Noise gate applied to ${user.username}`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
+                        } else {
+                            Toasts.show({ message: "No active voice connection", type: Toasts.Type.FAILURE, id: Toasts.genId() });
                         }
                     }}
                 />
@@ -335,15 +343,16 @@ export default definePlugin({
     },
 
     start() {
+        if (!SpeakingStore?.getSpeakingFlags && !SpeakingStore?.isSpeaking)
+            console.error("[SelectiveNR] SpeakingStore not found — gates will stay closed");
         gateInterval = setInterval(tickGates, TICK_MS);
         if (settings.store.debugPanel) mountPanel();
+        restoreStaleVolumes().catch(e => console.error("[SelectiveNR] failed to restore volumes", e));
     },
 
     stop() {
         unmountPanel();
         if (gateInterval) { clearInterval(gateInterval); gateInterval = null; }
-        if (currentConn) { teardownSpeakingCallback(currentConn); currentConn = null; }
-        speakingStates.clear();
         for (const userId of suppressed) stopSuppressing(userId);
         suppressed.clear();
     },
