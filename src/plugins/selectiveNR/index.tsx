@@ -8,7 +8,7 @@ import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 import { findByPropsLazy, findStoreLazy } from "@webpack";
-import { Menu, React, SelectedChannelStore, Toasts, UserStore, VoiceStateStore } from "@webpack/common";
+import { Menu, React, SelectedChannelStore, showToast, UserStore, VoiceStateStore } from "@webpack/common";
 
 const settings = definePluginSettings({
     attack: {
@@ -329,12 +329,12 @@ export default definePlugin({
                         if (isSuppressed) {
                             suppressed.delete(user.id);
                             stopSuppressing(user.id);
-                            Toasts.show({ message: `Noise gate removed for ${user.username}`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
+                            showToast({ text: `Noise gate removed for ${user.username}`, variant: "success" });
                         } else if (startSuppressing(user.id)) {
                             suppressed.add(user.id);
-                            Toasts.show({ message: `Noise gate applied to ${user.username}`, type: Toasts.Type.SUCCESS, id: Toasts.genId() });
+                            showToast({ text: `Noise gate applied to ${user.username}`, variant: "success" });
                         } else {
-                            Toasts.show({ message: "No active voice connection", type: Toasts.Type.FAILURE, id: Toasts.genId() });
+                            showToast({ text: "No active voice connection", variant: "critical" });
                         }
                     }}
                 />
